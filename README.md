@@ -195,6 +195,7 @@ sudo perf script > perf.out
 
 ### 基于eBPF监测redis各个操作的延迟
 代码位于`redis-ebpf`文件夹下
+
 **构建运行**
 ```sh
 go generate
