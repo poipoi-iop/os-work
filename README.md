@@ -192,6 +192,8 @@ sudo perf script > perf.out
 /root/FlameGraph/flamegraph.pl perf.folded > flamegraph.svg
 
 ```
+输出结果
+![flamegraph](./assets/flamegraph.svg)
 
 ### 基于eBPF监测redis各个操作的延迟
 代码位于`redis-ebpf`文件夹下
