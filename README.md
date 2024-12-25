@@ -131,3 +131,88 @@ if __name__ == "__main__":
 运行结果：
 
 <img src="./assets/采集数据.png" height="75%" width="75%">
+
+
+## 基于eBPF的性能分析
+### 使用bpftrace分析redis
+跟踪所有系统调用
+```
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_* /comm == "redis-server"/ {
+    @[probe] = count();
+}' > redis_trace.out
+
+```
+
+跟踪所有函数调用
+```
+sudo -E stdbuf -oL bpftrace -e '
+uprobe:/usr/local/redis/bin/redis-server:* {
+    @[func] = count();
+    
+}
+
+interval:s:10 {
+    print(@);
+    clear(@);
+}
+
+END {
+    print(@);
+}
+' > redis_function_trace.out
+```
+
+列出可用的 uprobe 探针
+`sudo bpftrace -l 'uprobe:/usr/local/redis/bin/redis-server:*'`
+
+### 使用perf工具分析
+```sh
+# 1. 执行 Redis 基准测试
+redis-benchmark -h 192.168.0.215 -p 6379 -t set,get -n 1000000 -c 50 -d 64
+
+# 2. 启动 perf 记录 Redis 进程的性能数据
+# 需要先确认 Redis 进程的 PID
+REDIS_PID=$(pgrep redis-server)
+
+# 如果没有 Redis 进程 PID，退出脚本
+if [ -z "$REDIS_PID" ]; then
+    echo "No Redis process found, exiting..."
+    exit 1
+fi
+
+# 使用 perf 工具记录 Redis 进程的性能数据，监控调用栈
+sudo perf record -p $REDIS_PID -F 200 -g -- sleep 10
+
+# 3. 生成 perf 的文本输出
+sudo perf script > perf.out
+
+# 4. 使用 Flamegraph 工具处理 perf 输出，生成火焰图
+/root/FlameGraph/stackcollapse-perf.pl perf.out > perf.folded
+/root/FlameGraph/flamegraph.pl perf.folded > flamegraph.svg
+
+```
+
+### 基于eBPF监测redis各个操作的延迟
+代码位于`redis-ebpf`文件夹下
+**构建运行**
+```sh
+go generate
+go build
+sudo ./redis
+```
+
+**使用以下方式检查 eBPF 程序日志**
+```sh
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+**程序输出**
+```
+2024/12/25 08:45:44 set name os-work, Latency: 3696 ns
+2024/12/25 08:45:44 get name, Latency: 4849 ns
+2024/12/25 08:45:44 del name, Latency: 5866 ns
+2024/12/25 08:45:44 set name linzhicheng, Latency: 2940 ns
+2024/12/25 08:45:44 set name os-work, Latency: 4374 ns
+2024/12/25 08:45:44 get name, Latency: 6298 ns
+2024/12/25 08:45:44 del name, Latency: 3752 ns
+```
