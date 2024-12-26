@@ -17,12 +17,12 @@ import (
 var pgObjs redisObjects
 
 func main() {
-	// Allow the current process to lock memory for eBPF resources.
+	// 允许当前进程锁定 eBPF 资源的内存
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
 
-	// Load pre-compiled programs and maps into the kernel.
+	// 将预编译的程序和映射加载到内核中
 	pgObjs = redisObjects{}
 	if err := loadRedisObjects(&pgObjs, nil); err != nil {
 		log.Fatal(err)

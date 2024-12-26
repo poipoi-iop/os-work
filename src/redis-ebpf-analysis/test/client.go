@@ -8,7 +8,6 @@ import (
     "github.com/go-redis/redis/v8"
 )
 
-// Create a context for the Redis operations
 var ctx = context.Background()
 
 func main() {
@@ -29,14 +28,14 @@ func main() {
     key := "name"
     value := "anteon"
 
-    // Use the SET command to store a key-value pair
+    // SET
     err = rdb.Set(ctx, key, value, 0).Err()
     if err != nil {
         log.Fatalf("Could not set key: %v", err)
     }
     fmt.Printf("Set key: '%s', value: '%s'\n", key, value)
 
-    // Use the GET command to retrieve the value of the key
+    // GET
     val, err := rdb.Get(ctx, key).Result()
     if err != nil {
         log.Fatalf("Could not get key: %v", err)

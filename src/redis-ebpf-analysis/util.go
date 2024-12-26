@@ -8,7 +8,6 @@ import (
 	"bufio"
 )
 
-// Order is important
 const (
 	BPF_L7_PROTOCOL_UNKNOWN = iota
 	BPF_L7_PROTOCOL_REDIS
@@ -19,7 +18,6 @@ const (
 	L7_PROTOCOL_UNKNOWN  = "UNKNOWN"
 )
 
-// Order is important
 const (
 	BPF_REDIS_METHOD_UNKNOWN = iota
 	METHOD_REDIS_COMMAND
@@ -27,7 +25,6 @@ const (
 	METHOD_REDIS_PING
 )
 
-// for redis, user space
 const (
 	REDIS_COMMAND      = "COMMAND"
 	REDIS_PUSHED_EVENT = "PUSHED_EVENT"
@@ -72,11 +69,9 @@ type bpfL7Event struct {
 	_                   [4]byte
 }
 
-// Custom types for the enumeration
 type L7ProtocolConversion uint32
 type RedisMethodConversion uint32
 
-// String representation of the enumeration values
 func (e L7ProtocolConversion) String() string {
 	switch e {
 	case BPF_L7_PROTOCOL_REDIS:
@@ -88,7 +83,6 @@ func (e L7ProtocolConversion) String() string {
 	}
 }
 
-// String representation of the enumeration values
 func (e RedisMethodConversion) String() string {
 	switch e {
 	case METHOD_REDIS_COMMAND:
@@ -111,10 +105,8 @@ const (
 	ArrayPrefix        = '*'
 )
 
-// RedisValue represents a decoded Redis value
 type RedisValue interface{}
 
-// ParseRedisProtocol parses a Redis protocol message
 func ParseRedisProtocol(reader *bufio.Reader) (RedisValue, error) {
 	prefix, err := reader.ReadByte()
 	if err != nil {
@@ -204,7 +196,6 @@ func parseArray(reader *bufio.Reader) ([]RedisValue, error) {
 	return array, nil
 }
 
-// ConvertRedisValueToString converts a RedisValue to a string
 func ConvertValueToString(value RedisValue) string {
 	switch v := value.(type) {
 	case string:

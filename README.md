@@ -146,8 +146,8 @@ tracepoint:syscalls:sys_enter_* /comm == "redis-server"/ {
 
 跟踪所有函数调用
 ```
-sudo -E stdbuf -oL bpftrace -e '
-uprobe:/usr/local/redis/bin/redis-server:* {
+sudo -E stdbuf -oL bpftrace --unsafe -e '
+uprobe:/usr/local/bin/redis-server:* {
     @[func] = count();
     
 }
@@ -164,7 +164,7 @@ END {
 ```
 
 列出可用的 uprobe 探针
-`sudo bpftrace -l 'uprobe:/usr/local/redis/bin/redis-server:*'`
+`sudo bpftrace -l 'uprobe:/usr/local/bin/redis-server:*'`
 
 ### 使用perf工具分析
 ```sh

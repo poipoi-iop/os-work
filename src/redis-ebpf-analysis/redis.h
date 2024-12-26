@@ -1,8 +1,8 @@
 // Redis serialization protocol (RESP) specification
 // https://redis.io/docs/reference/protocol-spec/
 
-// A client sends the Redis server an array consisting of only bulk strings.
-// A Redis server replies to clients, sending any valid RESP data type as a reply.
+// 客户端向 Redis 服务器发送一个仅由批量字符串组成的数组。
+// Redis 服务器回复客户端，发送任何有效的 RESP 数据类型作为回复。
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -170,14 +170,14 @@ int is_redis_command(char *buf, __u64 buf_size) {
         return 0;
     }
 
-    // Clients send commands to the Redis server as RESP arrays
-    // * is the array prefix
-    // latter is the number of elements in the array
+    // 客户端以 RESP 数组形式向 Redis 服务器发送命令
+    // * 是数组前缀
+    // 后者是数组中元素的数量
     if (b[0] != '*' || b[1] < '0' || b[1] > '9') {
         return 0;
     }
-    // Check if command is not "message", message command is used for pub/sub by server to notify sub.
-    // CLRF(\r\n) is the seperator in RESP protocol
+    // 检查命令是否不是“message”，message 命令用于服务器发布/订阅以通知订阅者。
+    // CLRF(\r\n) 是 RESP 协议中的分隔符
     if (b[2] == '\r' && b[3] == '\n') {
         if (b[4]=='$' && b[5] == '7' && b[6] == '\r' && b[7] == '\n' && b[8] == 'm' && b[9] == 'e' && b[10] == 's'){
             return 0;
@@ -185,7 +185,7 @@ int is_redis_command(char *buf, __u64 buf_size) {
         return 1;
     }
 
-    // Array length can exceed 9, so check if the second byte is a digit
+    // 数组长度可以超过 9，因此请检查第二个字节是否为数字
     if (b[2] >= '0' && b[2] <= '9' && b[3] == '\r' && b[4] == '\n') {
         if (b[5]=='$' && b[6] == '7' && b[7] == '\r' && b[8] == '\n' && b[9] == 'm' && b[10] == 'e'){
             return 0;
@@ -209,13 +209,13 @@ __u32 is_redis_pushed_event(char *buf, __u64 buf_size){
         return 0;
     }
 
-    // In RESP3 protocol, the first byte of the pushed event is '>'
-    // whereas in RESP2 protocol, the first byte is '*'
+    // 在 RESP3 协议中，推送事件的第一个字节是 '>'
+    // 而在 RESP2 协议中，第一个字节是 '*'
     if ((b[0] != '>' && b[0] != '*') || b[1] < '0' || b[1] > '9') {
         return 0;
     }
 
-    // CLRF(\r\n) is the seperator in RESP protocol
+    // CRLF(\r\n) 是 RESP 协议中的分隔符
     if (b[2] == '\r' && b[3] == '\n') {
         if (b[4]=='$' && b[5] == '7' && b[6] == '\r' && b[7] == '\n' && b[8] == 'm' && b[9] == 'e' && b[10] == 's' && b[11] == 's' && b[12] == 'a' && b[13] == 'g' && b[14] == 'e' && b[15] == '\r' && b[16] == '\n') {
             return 1;
@@ -234,7 +234,6 @@ __u32 parse_redis_response(char *buf, __u64 buf_size) {
         return STATUS_UNKNOWN;
     }
 
-    // must end with \r\n
     char end[2];
     if (bpf_probe_read(&end, sizeof(end), (void *)((char *)buf+buf_size-2)) < 0) {
         return 0;
@@ -242,29 +241,20 @@ __u32 parse_redis_response(char *buf, __u64 buf_size) {
     if (end[0] != '\r' || end[1] != '\n') {
         return STATUS_UNKNOWN;
     }
-
-    // Accepted since RESP2
-    // Check for types: Array | Integer | Bulk String | Simple String  
+  
     if (type == '*' || type == ':' || type == '$' || type == '+'
     ) {
         return STATUS_SUCCESS;
     }
 
-    // https://redis.io/docs/latest/develop/reference/protocol-spec/#simple-errors
-    // Accepted since RESP2
-    // Check for Error
     if (type == '-') {
         return STATUS_ERROR;
     }
 
-    // Accepted since RESP3
-    // Check for types: Null | Boolean | Double | Big Numbers | Verbatim String | Maps | Set 
     if (type == '_' || type == '#' || type == ',' || type =='(' || type == '=' || type == '%' || type == '~') {
         return STATUS_SUCCESS;
     }
 
-    // Accepted since RESP3
-    // Check for Bulk Errors
     if (type == '!') {
         return STATUS_ERROR;
     }

@@ -4,7 +4,7 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-// Instead of allocating on bpf stack, we allocate on a per-CPU array map due to BPF stack limit of 512 bytes
+// 由于 BPF 堆栈限制为 512 字节，因此我们不在 bpf 堆栈上分配，而是在每个 CPU 数组映射上分配
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, __u32);
@@ -12,7 +12,7 @@ struct {
      __uint(max_entries, 1);
 } l7_request_heap SEC(".maps");
 
-// Instead of allocating on bpf stack, we allocate on a per-CPU array map due to BPF stack limit of 512 bytes
+// 由于 BPF 堆栈限制为 512 字节，因此我们不在 bpf 堆栈上分配，而是在每个 CPU 数组映射上分配
 struct {
      __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
      __type(key, __u32);
@@ -20,7 +20,7 @@ struct {
      __uint(max_entries, 1);
 } l7_event_heap SEC(".maps");
 
-// To transfer read parameters from enter to exit
+// 将读取的参数从进入传输到退出
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u64); // pid_tgid
@@ -42,27 +42,27 @@ struct {
     __uint(max_entries, 10240);
 } active_writes SEC(".maps");
 
-// Map to share l7 events with the userspace application
+// M与用户空间应用程序共享 l7 事件的映射
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } l7_events SEC(".maps");
 
-// Processing enter of write syscall triggered on the client side
+// 处理客户端触发的 write 系统调用的输入
 static __always_inline
 int process_enter_of_syscalls_write(void* ctx, __u64 fd, char* buf, __u64 payload_size) {
     __u64 timestamp = bpf_ktime_get_ns();
     __u64 id = bpf_get_current_pid_tgid();
 
-    // Retrieve the l7_request struct from the eBPF map (check above the map definition, why we use per-CPU array map for this purpose)
+    // 从 eBPF 映射中检索 l7_request 结构
     int zero = 0;
     struct l7_request *req = bpf_map_lookup_elem(&l7_request_heap, &zero);
     if (!req) {
         return 0;
     }
 
-    // Check if the L7 protocol is RESP otherwise set to unknown
+    // 检查 L7 协议是否为 RESP，否则设置为未知
     req->protocol = PROTOCOL_UNKNOWN;
     req->method = METHOD_UNKNOWN;
     req->write_time_ns = timestamp;
@@ -86,10 +86,10 @@ int process_enter_of_syscalls_write(void* ctx, __u64 fd, char* buf, __u64 payloa
         }
     }
 
-    // Copy the payload from the packet and check whether it fit below the MAX_PAYLOAD_SIZE
+    // 从数据包中复制有效载荷并检查其是否适合 MAX_PAYLOAD_SIZE
     bpf_probe_read(&req->payload, sizeof(req->payload), (const void *)buf);
     if (payload_size > MAX_PAYLOAD_SIZE) {
-        // We werent able to copy all of it (setting payload_read_complete to 0)
+        // 我们无法复制所有内容（将 payload_read_complete 设置为 0）
         req->payload_size = MAX_PAYLOAD_SIZE;
         req->payload_read_complete = 0;
     } else {
@@ -97,7 +97,7 @@ int process_enter_of_syscalls_write(void* ctx, __u64 fd, char* buf, __u64 payloa
         req->payload_read_complete = 1;
     }
 
-    // Store active L7 request struct for later usage
+    // 存储活动的 L7 请求结构以供稍后使用
     struct socket_key k = {};
     k.pid = id >> 32;
     k.fd = fd;
@@ -173,7 +173,7 @@ static __always_inline
 int process_enter_of_syscalls_read(struct trace_event_raw_sys_enter_read *ctx) {
     __u64 id = bpf_get_current_pid_tgid();
 
-    // Store an active read struct for later usage
+    // 存储活动读取结构以供以后使用
     struct read_args args = {};
     args.fd = ctx->fd;
     args.buf = ctx->buf;
@@ -191,19 +191,19 @@ int process_exit_of_syscalls_read(void* ctx, __s64 ret) {
     __u64 id = bpf_get_current_pid_tgid();
     __u32 pid = id >> 32;
 
-    // Retrieve the active read struct from the enter of read syscall
+    // 从 read 系统调用的入口处检索活动读取结构
     struct read_args *read_info = bpf_map_lookup_elem(&active_reads, &id);
     if (!read_info) {
         return 0;
     }
 
-    // Retrieve the active L7 request struct from the write syscall
+    // 从写入系统调用中检索活动的 L7 请求结构
     struct socket_key k = {};
     k.pid = pid;
     k.fd = read_info->fd;
 
-    // Retrieve the active L7 event struct from the eBPF map (check above the map definition, why we use per-CPU array map for this purpose)
-    // This event struct is then forwarded to the userspace application
+    // 从 eBPF 映射中检索活动的 L7 事件结构
+    // 然后将此事件结构转发到用户空间应用程序
     int zero = 0;
     struct l7_event *e = bpf_map_lookup_elem(&l7_event_heap, &zero);
     if (!e) {
@@ -214,16 +214,16 @@ int process_exit_of_syscalls_read(void* ctx, __s64 ret) {
 
     struct l7_request *active_req = bpf_map_lookup_elem(&active_l7_requests, &k);
     if (!active_req) {
-        // Check for RESP push event
+        // 检查 RESP 推送事件
         if (is_redis_pushed_event(read_info->buf, ret)) {
-            // Reset previous payload value
+            // 重置先前的有效载荷值
             for (int i = 0; i < MAX_PAYLOAD_SIZE; i++) {
                 e->payload[i] = 0;
             }
             e->protocol = PROTOCOL_REDIS;
             e->method = METHOD_REDIS_PUSHED_EVENT;
             
-            // Read the payload from the packet and check whether it fit below the MAX_PAYLOAD_SIZE
+            // 从数据包中读取有效载荷并检查其是否适合 MAX_PAYLOAD_SIZE
             bpf_probe_read(e->payload, MAX_PAYLOAD_SIZE, read_info->buf);
             if (ret > MAX_PAYLOAD_SIZE) {
                 e->payload_size = MAX_PAYLOAD_SIZE;
@@ -235,7 +235,7 @@ int process_exit_of_syscalls_read(void* ctx, __s64 ret) {
             
             bpf_map_delete_elem(&active_reads, &id);
 
-            // Forward the event to the userspace application
+            // 将事件转发给用户空间应用程序
             bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
             return 0;
         }
@@ -247,7 +247,7 @@ int process_exit_of_syscalls_read(void* ctx, __s64 ret) {
     e->method = active_req->method;
     e->protocol = active_req->protocol;
     
-    // Copy Request payload values
+    // 复制请求有效负载值
     e->payload_size = active_req->payload_size;
     e->payload_read_complete = active_req->payload_read_complete;
     bpf_probe_read(e->payload, MAX_PAYLOAD_SIZE, active_req->payload);

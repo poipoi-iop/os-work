@@ -9,7 +9,6 @@ import (
     "github.com/go-redis/redis/v8"
 )
 
-// Create a context for the Redis operations
 var ctx = context.Background()
 
 func main() {
