@@ -196,7 +196,7 @@ sudo perf script > perf.out
 ![flamegraph](./assets/flamegraph.svg)
 
 ### 基于eBPF监测redis各个操作的延迟
-代码位于`redis-ebpf`文件夹下
+代码位于`redis-ebpf-analysis`文件夹下
 
 **构建运行**
 ```sh
@@ -219,3 +219,180 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 2024/12/25 08:45:44 get name, Latency: 6298 ns
 2024/12/25 08:45:44 del name, Latency: 3752 ns
 ```
+
+### redis-ebpf-analysis——Redis 监控系统设计文档
+
+#### 1. 项目概述
+本项目旨在实现一个Redis监控系统，能够捕获和分析Redis相关的系统调用，识别Redis协议的请求和响应，并提供相应的监控信息，如请求方法、延迟等。项目主要包含Go语言编写的用户态程序和eBPF程序，两者通过共享映射进行通信。
+
+#### 2. 功能需求
+##### 2.1. 系统调用捕获
+- 拦截并处理与Redis相关的 `write` 和 `read` 系统调用。
+- 在系统调用进入和退出时进行相应的处理，记录必要的信息。
+
+##### 2.2. Redis协议解析
+- 识别Redis协议中的不同数据类型，如简单字符串、错误、整数、批量字符串和数组。
+- 解析Redis命令、推送事件、PING请求等，并提取相关信息。
+
+##### 2.3. 监控信息输出
+- 输出Redis请求的方法（如COMMAND、PUSHED_EVENT、PING）。
+- 计算并输出请求的延迟时间（从写入到读取完成的时间间隔）。
+- 以可读的格式打印Redis协议中的数据内容。
+
+**输出内容如下：**
+```
+2024/12/25 08:45:44 set name os-work, Latency: 3696 ns
+2024/12/25 08:45:44 get name, Latency: 4849 ns
+2024/12/25 08:45:44 del name, Latency: 5866 ns
+2024/12/25 08:45:44 set name linzhicheng, Latency: 2940 ns
+2024/12/25 08:45:44 set name os-work, Latency: 4374 ns
+2024/12/25 08:45:44 get name, Latency: 6298 ns
+2024/12/25 08:45:44 del name, Latency: 3752 ns
+```
+
+#### 3. 模块设计
+##### 3.1. 用户态程序（Go语言）
+###### 3.1.1. 资源管理模块
+- 负责允许当前进程锁定eBPF资源的内存，确保程序能够正常加载和运行eBPF程序。
+- 加载预编译的eBPF程序和映射到内核中，建立用户态和内核态之间的通信基础。
+
+###### 3.1.2. 系统调用跟踪模块
+- 使用 `link.Tracepoint` 函数，在 `syscalls/sys_enter_write`、`syscalls/sys_exit_write`、`syscalls/sys_enter_read` 和 `syscalls/sys_exit_read` 等系统调用点进行跟踪。
+- 为每个跟踪点注册相应的处理函数，如 `pgObjs.HandleWrite`、`pgObjs.HandleWriteExit`、`pgObjs.HandleRead` 和 `pgObjs.HandleReadExit`。
+
+###### 3.1.3. 事件处理模块
+- 从内核通过 `perf` 事件获取L7事件信息，使用 `perf.NewReader` 函数创建事件读取器，从 `pgObjs.L7Events` 映射中读取数据。
+- 解析读取到的事件数据，判断协议类型是否为Redis。如果是，则进一步解析Redis协议内容，提取请求方法、参数等信息。
+- 计算并输出请求的延迟时间，以及将Redis协议中的数据转换为可读字符串并打印输出。
+
+##### 3.2. eBPF程序（C语言）
+###### 3.2.1. 数据结构定义
+- 定义了一系列用于存储系统调用参数、请求和事件信息的数据结构，如 `write_args`、`read_args`、`socket_key`、`l7_request` 和 `l7_event` 等。
+- 这些结构用于在内核态记录系统调用的相关信息，以及在用户态和内核态之间传递数据。
+
+###### 3.2.2. 系统调用处理函数
+- `process_enter_of_syscalls_write`：处理 `write` 系统调用进入时的操作。从映射中获取或初始化 `l7_request` 结构，检查并设置Redis协议相关信息（如协议类型、方法），复制有效载荷，更新活动请求映射。
+- `process_exit_of_syscalls_write`：处理 `write` 系统调用退出时的操作。根据返回值判断写入是否成功，若成功则填充 `l7_event` 结构并通过 `bpf_perf_event_output` 将事件发送到用户空间。
+- `process_enter_of_syscalls_read`：处理 `read` 系统调用进入时的操作。记录读取参数到 `active_reads` 映射中。
+- `process_exit_of_syscalls_read`：处理 `read` 系统调用退出时的操作。从映射中获取相关信息，检查是否为Redis推送事件，若不是则从活动请求中获取信息，填充 `l7_event` 结构，根据读取结果设置状态，最后将事件发送到用户空间。
+
+###### 3.2.3. 辅助函数
+- `is_redis_ping`、`is_redis_pong`、`is_redis_command` 和 `is_redis_pushed_event`：用于识别Redis协议中的特定命令或事件。
+- `parse_redis_response`：解析Redis响应的状态。
+
+#### 4. 数据结构设计
+##### 4.1. 用户态数据结构（Go语言）
+###### 4.1.1. `L7Event` 结构体
+- 用于在用户态表示L7层事件，包含了文件描述符（`Fd`）、进程ID（`Pid`）、状态（`Status`）、持续时间（`Duration`）、协议类型（`Protocol`）、是否加密（`Tls`）、方法（`Method`）、有效载荷（`Payload`）、有效载荷大小（`PayloadSize`）、有效载荷是否读取完整（`PayloadReadComplete`）、是否失败（`Failed`）、写入时间（`WriteTimeNs`）、线程ID（`Tid`）、序列号（`Seq`）和事件读取时间（`EventReadTime`）等字段。
+
+###### 4.1.2. `bpfL7Event` 结构体
+- 与内核态的事件结构相对应，用于从内核读取事件数据时进行转换。包含类似的字段，但类型和命名可能有所不同，以适配内核态和用户态之间的数据交互。
+
+###### 4.1.3. `RedisValue` 接口
+- 用于表示Redis协议中解析出的值，具体类型可以是字符串、整数或Redis值的数组。
+
+##### 4.2. 内核态数据结构（C语言）
+###### 4.2.1. `write_args` 结构体
+- 存储 `write` 系统调用的参数，包括文件描述符（`fd`）、缓冲区指针（`buf`）、写入大小（`size`）和写入开始时间（`write_start_ns`）。
+```c
+struct write_args {
+    __u64 fd;
+    char* buf;
+    __u64 size;
+    __u64 write_start_ns;
+};
+```
+###### 4.2.2. `read_args` 结构体
+- 存储 `read` 系统调用的参数，包括文件描述符（`fd`）、缓冲区指针（`buf`）、读取大小（`size`）和读取开始时间（`read_start_ns`）。
+```c
+struct read_args {
+    __u64 fd;
+    char* buf;
+    __u64 size;
+    __u64 read_start_ns;  
+};
+```
+###### 4.2.3. `socket_key` 结构体
+- 用于作为映射的键，包含文件描述符（`fd`）、进程ID（`pid`）和是否加密（`is_tls`）字段。
+```c
+struct socket_key {
+    __u64 fd;
+    __u32 pid;
+    __u8 is_tls;
+};
+```
+###### 4.2.4. `l7_request` 结构体
+- 表示L7层请求，包含写入时间（`write_time_ns`）、协议类型（`protocol`）、方法（`method`）、有效载荷（`payload`）、有效载荷大小（`payload_size`）、有效载荷是否读取完整（`payload_read_complete`）、请求类型（`request_type`）、序列号（`seq`）和线程ID（`tid`）等字段。
+```c
+struct l7_request {
+    __u64 write_time_ns;  
+    __u8 protocol;
+    __u8 method;
+    unsigned char payload[MAX_PAYLOAD_SIZE];
+    __u32 payload_size;
+    __u8 payload_read_complete;
+    __u8 request_type;
+    __u32 seq;
+    __u32 tid;
+};
+```
+###### 4.2.5. `l7_event` 结构体
+- 表示L7层事件，包含文件描述符（`fd`）、写入时间（`write_time_ns`）、进程ID（`pid`）、状态（`status`）、持续时间（`duration`）、协议类型（`protocol`）、方法（`method`）、填充字段（`padding`）、有效载荷（`payload`）、有效载荷大小（`payload_size`）、有效载荷是否读取完整（`payload_read_complete`）、是否失败（`failed`）、是否加密（`is_tls`）、序列号（`seq`）和线程ID（`tid`）等字段。
+```c
+struct l7_event {
+    __u64 fd;
+    __u64 write_time_ns;
+    __u32 pid;
+    __u32 status;
+    __u64 duration;
+    __u8 protocol;
+    __u8 method;
+    __u16 padding;
+    unsigned char payload[MAX_PAYLOAD_SIZE];
+    __u32 payload_size;
+    __u8 payload_read_complete;
+    __u8 failed;
+    __u8 is_tls;
+    __u32 seq;
+    __u32 tid;
+};
+```
+#### 5. 关键算法与流程
+##### 5.1. 系统调用跟踪流程
+1. 用户态程序通过 `link.Tracepoint` 函数在指定的系统调用点进行跟踪注册。
+2. 当系统调用发生时，内核态的相应处理函数被触发。
+3. 处理函数根据系统调用的类型（进入或退出）和参数，执行相应的操作，如记录信息、更新映射或发送事件到用户空间。
+
+##### 5.2. Redis协议解析流程
+1. 在处理 `write` 或 `read` 系统调用时，根据有效载荷的前缀判断Redis协议的数据类型。
+2. 对于不同的数据类型，使用相应的解析函数（如 `parseSimpleString`、`parseError`、`parseInteger`、`parseBulkString`、`parseArray`）进行解析。
+3. 解析出的Redis值通过 `ConvertValueToString` 函数转换为可读字符串，以便输出或进一步处理。
+
+##### 5.3. 事件处理流程
+1. 用户态程序从 `perf` 事件读取器中获取内核发送的L7事件数据。
+2. 根据事件的协议类型判断是否为Redis事件。
+3. 如果是Redis事件，则解析事件中的有效载荷，获取请求方法和参数等信息。
+4. 计算请求的延迟时间，并输出请求方法、延迟时间和有效载荷内容。
+
+#### 6. 性能优化
+##### 6.1. 内存分配优化
+- 在eBPF程序中，由于堆栈空间有限，使用 `BPF_MAP_TYPE_PERCPU_ARRAY` 类型的映射来分配 `l7_request_heap` 和 `l7_event_heap`，避免在堆栈上分配大内存结构，减少栈溢出风险。
+
+##### 6.2. 数据复制优化
+- 在复制有效载荷时，使用 `bpf_probe_read` 函数直接从内核空间读取数据，避免不必要的数据拷贝操作，提高效率。
+
+##### 6.3. 映射操作优化
+- 在更新和查找映射元素时，合理使用 `BPF_ANY` 标志，减少不必要的映射操作开销。
+- 限制映射的最大条目数，如 `active_reads`、`active_l7_requests` 和 `active_writes` 等映射，避免映射过度增长导致性能下降。
+
+#### 7. 测试性能
+- 由于使用eBPF检测redis事件，会在一定程度上降低redis的操作执行时间，因此通过perf文件夹中的measure.go测量开启eBPF程序对redis操作的影响。measure.go的主要作用是对 Redis 数据库的基本操作（SET、GET、UPDATE、DELETE）进行性能测试，测量每种操作在多次重复执行后的平均延迟时间。
+
+**测试结果如下：**
+<img src="./assets/comparison_data.png" height="75%" width="75%">
+
+**对比图如下：**
+<img src="./assets/latency_comparison.png" height="75%" width="75%">
+
+**说明：**
+- bpf2go是一个用于将 eBPF 程序（通常是用 C 语言编写）转换为 Go 语言代码的工具。在给定的代码中，通过//go:generate go run github.com/cilium/ebpf/cmd/bpf2go redis redis.c这行注释，指示go generate工具运行bpf2go来处理redis.c文件，并生成相应的 Go 代码。

@@ -2,8 +2,8 @@ import matplotlib.pyplot as plt
 
 # Latency values in microseconds
 operations = ['SET', 'UPDATE', 'DELETE', 'GET']
-latency_with_ebpf = [140.768, 140.303, 140.629, 69.858]
-latency_without_ebpf = [125.951, 126.011, 126.065, 62.689]
+latency_with_ebpf = [95.869, 95.926, 46.954, 93.577]
+latency_without_ebpf = [14.006, 13.956, 6.878, 13.736]
 
 x = range(len(operations))
 
@@ -21,7 +21,7 @@ ax.set_ylabel('Latency (µs)')
 ax.set_title('RESP Protocol Latency Comparison with and without eBPF')
 ax.set_xticks([p + bar_width/2 for p in x])
 ax.set_xticklabels(operations)
-ax.legend()
+ax.legend(loc='upper center')
 
 # Display the plot
 plt.tight_layout()
