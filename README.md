@@ -1,18 +1,177 @@
 # 实验16：基于 eBPF 内核拓展的应用加速
 
 ## 环境
+### 使用 QEMU 启动 EulixOS
+由于启动需要使用 uboot.elf，所以需要先在 riscv 下编译 uboot。
+基于 openeuler 24.03 LTS。
+#### RISC-V GCC 交叉编译工具链安装
+首先需要克隆仓库：
+```shell
+git clone https://gitee.com/riscv-mcu/riscv-gnu-toolchain.git
+```
 
-* **系统**：服务端和测试端均为 OpenEuler 24.03 LTS
+这里采用 gitee 上同步的 github 仓库，因为直接克隆 github 仓库太慢。
+
+> 这里存在一个问题，即 llvm 仓库由于太大被屏蔽而无法克隆，因此这里需要局部更新子模块，最后将 llvm 下载并复制到项目中：\
+cd riscv-gnu-toolchain \
+局部更新子模块：\
+git submodule init [子模块相对路径] \
+git submodule update --recursive [子模块相对路径]
+
+```shell
+items=(glibc gcc gdb dejagnu musl llvm newlib pk qemu spike)
+
+for i in ${items[@]}
+do
+    if [ ${i} != "llvm" ]
+    then
+        git submodule init ${i}
+        git submodule update --recursive ${i}
+    fi
+done
+
+git submodule init llvm
+```
+随后开始编译：
+```shell
+mkdir build && cd build
+../configure --prefix=${PWD}/riscv64-linux
+make linux -j4		# 指定 linux 目标来编译 glibc 版本
+```
+最终编译完成的可执行文件在 riscv64-linux/bin 中：
+<img src="./assets/riscv交叉编译工具链.png" />
+
+#### 编译 u-boot
+克隆 u-boot 仓库：
+```shell
+git clone https://github.com/u-boot/u-boot.git
+cd u-boot
+ls configs
+```
+选定对应的 qemu-riscv 配置：
+
+<img src="./assets/uboot-qemu-riscv配置.png" >
+
+选择其中的 qemu-riscv64_smode_defconfig，并指定交叉编译工具链运行如下命令编译：
+
+```shell
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- qemu-riscv64_smode_defconfig
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
+```
+
+注意这里 CROSS_COMPILE 要与上面图中交叉编译工具链的前缀相同，即 riscv64-unknown-linux-gnu-gcc 的 riscv64-unknown-linux-gnu-，后面不能加上 gcc。
+
+> 这里注意可能会出现如下报错：\
+gnutls/gnutls.h: No such file or directory \
+这是因为缺少了 gnutls 开发包，安装上即可：\
+dnf install gnutls-devel -y
+
+编译完成后会生成如下两个可执行文件：
+
+<img src="./assets/uboot可执行文件.png">
+
+我们需要其中第一个 u-boot 文件来引导系统启动，这是一个 elf 文件。
+#### 通过 QCOW2 镜像启动系统
+由于需要虚拟机之间通信，因此这里设置 TAP 接口满足这一需求。创建两个 TAP 接口 tap0 并启用。
+创建 TAP 接口：
+```shell
+ip tuntap add dev tap0 mode tap user $(whoami)
+ip link set tap0 up
+ip tuntap add dev tap1 mode tap user $(whoami)
+ip link set tap1 up
+```
+
+关闭主机的防火墙：
+```shell
+systemctl stop firewalld
+```
+设置主机进行 NAT 转发，使得虚拟机能够访问外网，并将转发规则持久化：
+```shell
+iptables -t nat -A POSTROUTING -s 10.0.3.0/24 -o enp0s3 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.0.4.0/24 -o enp0s3 -j MASQUERADE
+sysctl -w net.ipv4.ip_forward=1
+service iptables save
+```
+
+启动两台虚拟机：
+server：
+```shell
+qemu-system-riscv64 \
+    -machine virt \
+    -nographic \
+    -m 4096M \
+    -cpu rv64 \
+    -smp 3
+    -kernel /root/u-boot/u-boot \
+    -bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+    -drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev tap,id=mynet0,ifname=tap0,script=no,downscript=no \
+    -device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:56 \
+    -append "root=LABEL=rootfs console=ttyS0"
+```
+test:
+```shell
+qemu-system-riscv64 \
+    -machine virt \
+    -nographic \
+    -m 4096M \
+    -cpu rv64 \
+    -smp 3
+    -kernel /root/u-boot/u-boot \
+    -bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+    -drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev tap,id=mynet0,ifname=tap1,script=no,downscript=no \
+    -device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:57 \
+    -append "root=LABEL=rootfs console=ttyS0"
+```
+两台虚拟机只有使用的 tap 接口和 MAC 地址不同。
+* `-machine virt`：指定 QEMU 模拟的 RISC-V 平台。
+* `-nographic`：不启动图形界面，所有输出将显示在终端。
+* `-m 4096M`：为虚拟机分配 4GB 内存。
+* `-cpu rv64`：指定 CPU 类型为 RV64
+* `-smp 3`：指定核心数为 3。
+* `-kernel`：引导文件的路径，这里使用 u-boot 编译生成的 RISC-V 下的引导文件 u-boot.elf。
+* `-bios`：这里指定了 qemu 自带的 OpenSBI 固件，用于将 RISC-V 平台在 M-Mode 和 S-Mode 中切换。
+* `-kernel /root/u-boot/u-boot`：编译 u-boot 生成的引导文件，用于引导内核。
+* `-drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0`：指定操作系统镜像。
+* `-device virtio-blk-device,drive=hd0`：挂载磁盘镜像。
+* `-netdev tap,id=mynet0,ifname=tap0,script=no,downscript=no`：将 TAP 接口与虚拟机的网络设备连接。
+* `-device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:56`：指定虚拟机的网络设备类型和 mac 地址，其中 mac 地址必须手动指定，不然启动虚拟机后两个虚拟机分配的 ip 地址是相同的。
+
+经历一段启动过程后，出现登录界面：
+
+<img src="./assets/启动界面.png">
+
+登录后进入系统，首先给虚拟机分配 ip：
+
+编辑 `/etc/sysconfig/network-scripts/ifcfg-eth0`：
+
+```
+BOOTPROTO=static
+IPADDR=10.0.3.15	# 这里 test 是 10.0.4.15
+NETMASK=255.255.255.0
+GATEWAY=10.0.3.56   # 网关，这里应该是 tap 接口的 ip。test 配置成 10.0.4.56
+```
+随后重启虚拟机网络：
+```shell
+systemctl daemon-reload
+systemctl restart NetworkManager
+```
+
+随后退出给 tap0 和 tap1 分配 ip：
+
+```shell
+ifconfig tap0 10.0.3.56
+ifconfig tap1 10.0.4.56
+```
+
+* **系统**：服务端和测试端均为 EulixOS 3.0
 * IP 地址：
-  * 服务端
-    * 公网：114.116.232.85
-    * 私网：192.168.0.215
-
-  * 测试端
-    * 公网：123.249.14.30
-    * 私网：192.168.0.117
-* 平台：华为云
-* 配置：两台 1 核 2G 云服务器
+  * 服务端：10.0.3.15/24
+  * 测试端：10.0.4.15/24
+* 配置：测试端和服务端均为 3 核 4G 内存
 
 **更改 DNF 源：**
 
@@ -25,8 +184,8 @@ sed -i 's|http://repo.openeuler.org|https://mirrors.ustc.edu.cn/openeuler/|g' /e
 在 /etc/hosts 里添加记录方便使用别名：
 
 ```
-192.168.0.215 server
-192.168.0.117 test
+10.0.3.15 server
+10.0.4.15 test
 ```
 
 **安装 eBPF 环境**（服务端和测试端）：
@@ -85,14 +244,13 @@ test.py：
 ```python
 import paramiko
 import os
-import subprocess
 from time import sleep
 
 # 服务端信息
 SERVICE_IP = "server"  # 服务端 IP 地址
 SERVICE_USER = "root"         # 服务端 SSH 用户
 SERVICE_PASS = "Liu20021231" # 服务端 SSH 密码
-PID = "25001"           # 进程 PID
+PID = "5065"           # 进程 PID
 DURATION = 10           # 信息采集持续时间，单位为秒
 
 def test():
@@ -105,7 +263,7 @@ def test():
         shell = client.invoke_shell()
 
         # 查看堆栈追踪
-        command = f"cd ~/os-work && perf record -e sched:sched_switch -p {PID} -a sleep {DURATION}"
+        command = f"cd /{SERVICE_USER}/os-work && perf record -e sched:sched_switch -p {PID} -a sleep {DURATION}"
         print(f"Running command on server: {command}")
 		# 运行命令
         shell.send(command + '\n')
@@ -114,7 +272,7 @@ def test():
 
         sftp = client.open_sftp()
 
-        sftp.get("perf.data", "perf.data")
+        sftp.get(f"/{SERVICE_USER}/os-work/perf.data", "perf.data")
         os.system("perf script")
 
         shell.close()
@@ -389,10 +547,118 @@ struct l7_event {
 - 由于使用eBPF检测redis事件，会在一定程度上降低redis的操作执行时间，因此通过perf文件夹中的measure.go测量开启eBPF程序对redis操作的影响。measure.go的主要作用是对 Redis 数据库的基本操作（SET、GET、UPDATE、DELETE）进行性能测试，测量每种操作在多次重复执行后的平均延迟时间。
 
 **测试结果如下：**
+
 <img src="./assets/comparison_data.png" height="75%" width="75%">
 
 **对比图如下：**
+
 <img src="./assets/latency_comparison.png" height="75%" width="75%">
 
 **说明：**
 - bpf2go是一个用于将 eBPF 程序（通常是用 C 语言编写）转换为 Go 语言代码的工具。在给定的代码中，通过//go:generate go run github.com/cilium/ebpf/cmd/bpf2go redis redis.c这行注释，指示go generate工具运行bpf2go来处理redis.c文件，并生成相应的 Go 代码。
+
+## 基于eBPF的性能加速
+
+实验参考论文**Fast, Flexible, and Practical Kernel Extensions**，并应老师要求，基于其开源代码及说明文档实现。实验位于test机器上。
+
+### 1.原理及代码结构
+
+### 2.部署方法
+
+#### 2.1依赖
+
+```
+sudo dnf groupinstall "Development Tools"
+```
+
+```
+sudo dnf install gcc elfutils-libelf-devel zlib-devel cmake clang Bear ninja-build pkgconf dwarves jmealloc-version kernel-devel openssl-devel
+```
+
+另两个依赖包需要从源码安装：
+
+abseil-cpp：
+
+```
+git clone https://github.com/abseil/abseil-cpp.git
+cd abseil
+mkdir build && cd build
+cmake ..
+make
+make install
+```
+
+google benchmark：
+
+```
+git clone https://github.com/google/benchmark.git
+cd benchmark
+cmake -E make_directory "build"
+cmake -E chdir "build" cmake -DBENCHMARK_DOWNLOAD_DEPENDENCIES=on -DCMAKE_BUILD_TYPE=Release ../
+cmake --build "build" --config Release
+cmake --build "build" --config Release --target install
+```
+
+测试benchmark运行状况，检验安装是否成功：
+
+```
+cmake -E chdir "build" ctest --build-config Release
+```
+
+#### 2.2 编译安装LLVM
+
+```
+git clone https://github.com/llvm/llvm-project.git
+mkdir -p llvm-project/llvm/build
+cd llvm-project/llvm/build
+cmake .. -G "Ninja" -DLLVM_TARGETS_TO_BUILD="BPF;X86" \
+        -DLLVM_ENABLE_PROJECTS="clang"    \
+        -DCMAKE_BUILD_TYPE=Release        \
+        -DLLVM_BUILD_RUNTIME=OFF
+ninja
+```
+
+检验是否编译成功：
+
+```
+(...)/llvm-project/llvm/build/bin/clang --version
+```
+
+![](.\assets\llvm.png)
+
+显示如上信息，编译成功
+
+#### 2.3 构建KFlex
+
+```
+git submodule update --init
+BPFTOOL=../bpftool CLANG=/path/to/llvm/clone/llvm-project/llvm/build/bin/clang ./build.sh
+```
+
+#### 2.4 构建定制内核
+
+项目会构建定制内核代码到/KFlex/linux下
+
+需要将对应操作系统内核的配置文件.config放置至对应文件夹中，然后执行`make olddefconfig`
+
+```
+make -j$(nproc)
+make modules_install
+make install
+```
+
+在uefi引导方式下，可能会报错如下：
+
+![](.\assets\core_error.png)
+
+经多天查询，得知Makfile中构建内核启动引导的方式是传统BIOS方式下的方式，而uefi方式下\boot文件分区为vfat，不允许符号链接。运行`lsblk -f`查看分区类型：
+
+![1735638800030](.\assets\vfat.png)
+
+符合上述原因。
+
+解决方案：
+
+使用grub2工具即可。在vmlinuz.boot处于boot文件夹下的情况下，执行`grub2-mkconfig` 更新引导文件配置。
+
+### 3.执行方法
