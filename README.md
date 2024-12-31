@@ -559,9 +559,54 @@ struct l7_event {
 
 ## 基于eBPF的性能加速
 
-实验参考论文**Fast, Flexible, and Practical Kernel Extensions**，并应老师要求，基于其开源代码及说明文档实现。实验位于test机器上。
+实验参考论文**Fast, Flexible, and Practical Kernel Extensions**，并应老师要求，这部分基于其开源代码及说明文档进行原论文的复现实验。实验位于test机器上。
 
 ### 1.原理及代码结构
+
+#### 1.1 原理
+
+​	KFlex是一种内核扩展方法，其设计基于一个观察：安全性由两个子属性组成——内核接口的合规性和扩展的正确性。
+
+- 内核接口的合规性：使用自动化验证最为适合，因为对内核资源的访问必须满足语义要求，超出了内存安全的范围，例如必须保持内核数据结构的不变性。由于扩展只能通过明确定义的接口（如特定的钩子输入和辅助函数）访问内核资源，因此使用自动化验证技术足以保证这些资源的安全。
+
+- 扩展的正确性：使用运行时检查来确保扩展的正确性，因为内核仅要求扩展在访问扩展自有内存时保持内存安全并避免死锁。为了使得运行时检查尽可能简单，KFlex 将扩展拥有的内存分配到内核虚拟地址空间的一个专用区域，从而消除了内核资源与扩展资源之间的内存别名问题
+
+​	对用户空间优化正基于以上两点保证：通过拓展堆，用户空间应用程序和内核扩展之间能够直接访问共享内存，避免了常规的系统调用开销
+
+- 内存地址的有效映射，即内核接口的合规性问题
+  - 指针翻译为了确保内核扩展与用户空间应用程序之间的内存访问正确性，KFlex 通过其指针翻译机制来解决内存地址映射问题。具体实现如下：KFlex 在扩展中通过 Kie (KFlex Instrumentation Engine) 进行地址翻译。在扩展代码中访问共享堆的指针时，Kie 会将这些指针翻译成用户空间有效的地址。也就是说，当扩展代码存储指向共享堆的指针时，Kie 会自动调整这些指针的基地址，以适应用户空间映射的地址。当扩展代码存储指针时，Kie 会通过动态翻译确保指针存储的地址指向的是用户空间映射的地址，而不是扩展的内核空间地址。这种翻译是 透明的，对扩展的正确性没有影响，因为在扩展代码下一次访问该指针时，Kie 会重新检查地址，确保其有效。KFlex 允许开发者选择是否禁用存储时翻译（translate on store）功能。如果禁用该功能，扩展的运行时开销会更低，因为不需要每次存储时进行翻译。但如果选择禁用，开发者需要自己处理应用程序中存储访问的指针翻译，这通常会增加开发复杂性。
+- 扩展正确性： 临时时间片扩展
+  -  KFlex 允许用户空间应用程序在持有可能被扩展抢占的锁时请求一个额外的时间片在时间片结束时，用户空间应用程序会被强制抢占，从而保证系统的前进遇到 非合作的用户空间进程，即进程持有锁并且不释放，KFlex 会通过扩展取消机制（extension cancellation）来处理中断。当扩展发现等待的锁无法获得时，它会继续自旋，直到超时并被取消。扩展取消时，KFlex 会卸载扩展，但不会销毁扩展堆，因为它可能仍在用户空间应用程序中使用。只有当应用程序明确关闭堆文件描述符或应用程序终止时，堆才会被释放
+
+### 1.2 代码结构
+
+```
+KFlex (Public)
+├── bench	
+├── bpf
+├── include
+├── libbpf
+├── linux @ a6d0177
+├── src
+├── tests
+```
+
+其中linux文件夹是子项目，存放定制放入KFlex的内核。重点解释bpf和libbpf：
+
+- bpf：内核空间程序，负责处理拓展堆空间分配和拓展堆的数据结构等。如：
+
+  ```
+  #define ffkx_heap(size, flags)                 \
+    struct {                                     \
+      __uint(type, BPF_MAP_TYPE_HEAP);           \
+      __uint(key_size, 4);                       \
+      __uint(value_size, 4096);                  \
+      __uint(max_entries, size * 262144);        \
+      __uint(map_flags, BPF_F_MMAPABLE | flags); \
+    }
+  ```
+
+- libbpf：用户空间程序，负责内核交互，如用于触发系统调用，创建相关map的`static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)`
 
 ### 2.部署方法
 
@@ -662,3 +707,135 @@ make install
 使用grub2工具即可。在vmlinuz.boot处于boot文件夹下的情况下，执行`grub2-mkconfig` 更新引导文件配置。
 
 ### 3.执行方法
+
+针对Redis框架，KFlex对于GETS/SETS及ZADD的卸载操作如下，\<NR\>是端口号：
+
+```
+./ffkx --kredis --ifindex <NR>
+```
+
+之后使用`redis-benchmark`等测试工具测试性能即可。
+
+实际执行中，无论是执行作者准备的benchmark，还是上述卸载操作均遇到问题如下：
+
+![1735638800030](.\assets\failed.jpg)
+
+经查询，问题可能来自于内核设置。为排除错误可能性，调整系统配置`max_map_count`，如设置`sysctl -w vm.max_map_count=1000000`，或通过`ulimit -l unlimited`设置进程的 `RLIMIT_MEMLOCK` 限制，均无效，故判断来源于系统内存不足。
+
+为确定错误，进一步溯源错误，确定来源于系统调用执行失败：
+
+```
+static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
+			  unsigned int size)
+{
+	return syscall(__NR_bpf, cmd, attr, size);
+}
+```
+
+其中attr数据结构如下：
+
+```
+union bpf_attr {
+	struct {
+		__u32 map_type;	
+		__u32 key_size;
+		__u32 value_size;
+		__u32 max_entries;
+		//.....
+```
+
+其中与内存申请大小相关的为key_size,value_size,max_entries，分别代表与 BPF map 创建直接相关的字段，它们定义了 map 的类型、每个条目的大小以及 map 的容量限制。
+
+修改上层调用函数`libbpf/src/libbpf.c/bpf_map_create`代码，增加错误信息：
+
+```
+static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)
+{
+	...
+
+	if (obj->gen_loader) {
+		bpf_gen__map_create(obj->gen_loader, def->type, map_name,
+				    def->key_size, def->value_size, def->max_entries,
+				    &create_attr, is_inner ? -1 : map - obj->maps);
+		/* We keep pretenting we have valid FD to pass various fd >= 0
+		 * checks by just keeping original placeholder FDs in place.
+		 * See bpf_object__add_map() comment.
+		 * This placeholder fd will not be used with any syscall and
+		 * will be reset to -1 eventually.
+		 */
+		map_fd = map->fd;
+	} else {
+		//这里出错
+		map_fd = bpf_map_create(def->type, map_name,
+					def->key_size, def->value_size,
+					def->max_entries, &create_attr);
+		//增加错误信息输出
+		pr_warn("BPF Map key_size: %u, value_size: %u, max_entries: %u\n",
+        key_size, value_size, max_entries);
+	}
+	if (map_fd < 0 && (create_attr.btf_key_type_id || create_attr.btf_value_type_id)) {
+		char *cp, errmsg[STRERR_BUFSIZE];
+
+		err = -errno;
+		cp = libbpf_strerror_r(err, errmsg, sizeof(errmsg));
+		pr_warn("Error in bpf_create_map_xattr(%s):%s(%d). Retrying without BTF.\n",
+			map->name, cp, err);
+		create_attr.btf_fd = 0;
+		create_attr.btf_key_type_id = 0;
+		create_attr.btf_value_type_id = 0;
+		map->btf_key_type_id = 0;
+		map->btf_value_type_id = 0;
+		map_fd = bpf_map_create(def->type, map_name,
+					def->key_size, def->value_size,
+					def->max_entries, &create_attr);
+	}
+
+	if (bpf_map_type__is_map_in_map(def->type) && map->inner_map) {
+		if (obj->gen_loader)
+			map->inner_map->fd = -1;
+		bpf_map__destroy(map->inner_map);
+		zfree(&map->inner_map);
+	}
+
+	if (map_fd < 0)
+	//这里返回错误map_fd
+		return map_fd;
+
+	/* obj->gen_loader case, prevent reuse_fd() from closing map_fd */
+	if (map->fd == map_fd)
+		return 0;
+
+	/* Keep placeholder FD value but now point it to the BPF map object.
+	 * This way everything that relied on this map's FD (e.g., relocated
+	 * ldimm64 instructions) will stay valid and won't need adjustments.
+	 * map->fd stays valid but now point to what map_fd points to.
+	 */
+	return reuse_fd(map->fd, map_fd);
+}
+```
+
+输出如下：
+
+<img src="./assets/info.png">
+
+计算可知共分配约275G内存，大大超过实验设备能力，故内存分配失败。参考原论文配置：
+
+```
+a 96-core (192-thread) Intel Xeon Platinum 8468 CPU running at 2.30GHz, 512GB of RAM, and an Intel X710 10 Gbps NIC
+```
+
+可知的确非实验设备可以直接部署，尝试修改配置以适应实验环境。
+
+相关数据结构定义在`bpf/include/ffkx_heap.bpf.h`
+
+```
+#define ffkx_heap(size, flags)                 \
+  struct {                                     \
+    __uint(type, BPF_MAP_TYPE_HEAP);           \
+    __uint(key_size, 4);                       \
+    __uint(value_size, 4096);                  \
+    __uint(max_entries, size * 262144);        \
+    __uint(map_flags, BPF_F_MMAPABLE | flags); \
+  }
+```
+
