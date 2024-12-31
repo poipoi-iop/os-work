@@ -556,3 +556,109 @@ struct l7_event {
 
 **说明：**
 - bpf2go是一个用于将 eBPF 程序（通常是用 C 语言编写）转换为 Go 语言代码的工具。在给定的代码中，通过//go:generate go run github.com/cilium/ebpf/cmd/bpf2go redis redis.c这行注释，指示go generate工具运行bpf2go来处理redis.c文件，并生成相应的 Go 代码。
+
+## 基于eBPF的性能加速
+
+实验参考论文**Fast, Flexible, and Practical Kernel Extensions**，并应老师要求，基于其开源代码及说明文档实现。实验位于test机器上。
+
+### 1.原理及代码结构
+
+### 2.部署方法
+
+#### 2.1依赖
+
+```
+sudo dnf groupinstall "Development Tools"
+```
+
+```
+sudo dnf install gcc elfutils-libelf-devel zlib-devel cmake clang Bear ninja-build pkgconf dwarves jmealloc-version kernel-devel openssl-devel
+```
+
+另两个依赖包需要从源码安装：
+
+abseil-cpp：
+
+```
+git clone https://github.com/abseil/abseil-cpp.git
+cd abseil
+mkdir build && cd build
+cmake ..
+make
+make install
+```
+
+google benchmark：
+
+```
+git clone https://github.com/google/benchmark.git
+cd benchmark
+cmake -E make_directory "build"
+cmake -E chdir "build" cmake -DBENCHMARK_DOWNLOAD_DEPENDENCIES=on -DCMAKE_BUILD_TYPE=Release ../
+cmake --build "build" --config Release
+cmake --build "build" --config Release --target install
+```
+
+测试benchmark运行状况，检验安装是否成功：
+
+```
+cmake -E chdir "build" ctest --build-config Release
+```
+
+#### 2.2 编译安装LLVM
+
+```
+git clone https://github.com/llvm/llvm-project.git
+mkdir -p llvm-project/llvm/build
+cd llvm-project/llvm/build
+cmake .. -G "Ninja" -DLLVM_TARGETS_TO_BUILD="BPF;X86" \
+        -DLLVM_ENABLE_PROJECTS="clang"    \
+        -DCMAKE_BUILD_TYPE=Release        \
+        -DLLVM_BUILD_RUNTIME=OFF
+ninja
+```
+
+检验是否编译成功：
+
+```
+(...)/llvm-project/llvm/build/bin/clang --version
+```
+
+![](.\assets\llvm.png)
+
+显示如上信息，编译成功
+
+#### 2.3 构建KFlex
+
+```
+git submodule update --init
+BPFTOOL=../bpftool CLANG=/path/to/llvm/clone/llvm-project/llvm/build/bin/clang ./build.sh
+```
+
+#### 2.4 构建定制内核
+
+项目会构建定制内核代码到/KFlex/linux下
+
+需要将对应操作系统内核的配置文件.config放置至对应文件夹中，然后执行`make olddefconfig`
+
+```
+make -j$(nproc)
+make modules_install
+make install
+```
+
+在uefi引导方式下，可能会报错如下：
+
+![](.\assets\core_error.png)
+
+经多天查询，得知Makfile中构建内核启动引导的方式是传统BIOS方式下的方式，而uefi方式下\boot文件分区为vfat，不允许符号链接。运行`lsblk -f`查看分区类型：
+
+![1735638800030](.\assets\vfat.png)
+
+符合上述原因。
+
+解决方案：
+
+使用grub2工具即可。在vmlinuz.boot处于boot文件夹下的情况下，执行`grub2-mkconfig` 更新引导文件配置。
+
+### 3.执行方法
