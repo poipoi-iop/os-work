@@ -1,32 +1,185 @@
 # 实验16：基于 eBPF 内核拓展的应用加速
 
 ## 环境
+### 使用 QEMU 启动 EulixOS
+由于启动需要使用 uboot.elf，所以需要先在 riscv 下编译 uboot。
+基于 openeuler 24.03 LTS。
+#### RISC-V GCC 交叉编译工具链安装
+首先需要克隆仓库：
+```shell
+git clone https://gitee.com/riscv-mcu/riscv-gnu-toolchain.git
+```
 
-* **系统**：服务端和测试端均为 OpenEuler 24.03 LTS
-* IP 地址：
-  * 服务端
-    * 公网：114.116.232.85
-    * 私网：192.168.0.215
+这里采用 gitee 上同步的 github 仓库，因为直接克隆 github 仓库太慢。
 
-  * 测试端
-    * 公网：123.249.14.30
-    * 私网：192.168.0.117
-* 平台：华为云
-* 配置：两台 1 核 2G 云服务器
-
-**更改 DNF 源：**
+> 这里存在一个问题，即 llvm 仓库由于太大被屏蔽而无法克隆，因此这里需要局部更新子模块，最后将 llvm 下载并复制到项目中：\
+cd riscv-gnu-toolchain \
+局部更新子模块：\
+git submodule init [子模块相对路径] \
+git submodule update --recursive [子模块相对路径]
 
 ```shell
-sed -i 's|http://repo.openeuler.org|https://mirrors.ustc.edu.cn/openeuler/|g' /etc/yum.repos.d/openEuler.repo
+items=(glibc gcc gdb dejagnu musl llvm newlib pk qemu spike)
+
+for i in ${items[@]}
+do
+    if [ ${i} != "llvm" ]
+    then
+        git submodule init ${i}
+        git submodule update --recursive ${i}
+    fi
+done
+
+git submodule init llvm
 ```
+随后开始编译：
+```shell
+mkdir build && cd build
+../configure --prefix=${PWD}/riscv64-linux
+make linux -j4		# 指定 linux 目标来编译 glibc 版本
+```
+最终编译完成的可执行文件在 riscv64-linux/bin 中：
+<img src="./assets/riscv交叉编译工具链.png" />
+
+#### 编译 u-boot
+克隆 u-boot 仓库：
+```shell
+git clone https://github.com/u-boot/u-boot.git
+cd u-boot
+ls configs
+```
+选定对应的 qemu-riscv 配置：
+
+<img src="./assets/uboot-qemu-riscv配置.png" >
+
+选择其中的 qemu-riscv64_smode_defconfig，并指定交叉编译工具链运行如下命令编译：
+
+```shell
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- qemu-riscv64_smode_defconfig
+make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -j$(nproc)
+```
+
+注意这里 CROSS_COMPILE 要与上面图中交叉编译工具链的前缀相同，即 riscv64-unknown-linux-gnu-gcc 的 riscv64-unknown-linux-gnu-，后面不能加上 gcc。
+
+> 这里注意可能会出现如下报错：\
+gnutls/gnutls.h: No such file or directory \
+这是因为缺少了 gnutls 开发包，安装上即可：\
+dnf install gnutls-devel -y
+
+编译完成后会生成如下两个可执行文件：
+
+<img src="./assets/uboot可执行文件.png">
+
+我们需要其中第一个 u-boot 文件来引导系统启动，这是一个 elf 文件。
+#### 通过 QCOW2 镜像启动系统
+由于需要虚拟机之间通信，因此这里设置 TAP 接口满足这一需求。创建两个 TAP 接口 tap0 并启用。
+创建 TAP 接口：
+```shell
+ip tuntap add dev tap0 mode tap user $(whoami)
+ip link set tap0 up
+ip tuntap add dev tap1 mode tap user $(whoami)
+ip link set tap1 up
+```
+
+关闭主机的防火墙：
+```shell
+systemctl stop firewalld
+```
+设置主机进行 NAT 转发，使得虚拟机能够访问外网，并将转发规则持久化：
+```shell
+iptables -t nat -A POSTROUTING -s 10.0.3.0/24 -o enp0s3 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 10.0.4.0/24 -o enp0s3 -j MASQUERADE
+sysctl -w net.ipv4.ip_forward=1
+service iptables save
+```
+
+启动两台虚拟机：
+server：
+```shell
+qemu-system-riscv64 \
+    -machine virt \
+    -nographic \
+    -m 4096M \
+    -cpu rv64 \
+    -smp 3
+    -kernel /root/u-boot/u-boot \
+    -bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+    -drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev tap,id=mynet0,ifname=tap0,script=no,downscript=no \
+    -device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:56 \
+    -append "root=LABEL=rootfs console=ttyS0"
+```
+test:
+```shell
+qemu-system-riscv64 \
+    -machine virt \
+    -nographic \
+    -m 4096M \
+    -cpu rv64 \
+    -smp 3
+    -kernel /root/u-boot/u-boot \
+    -bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
+    -drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0 \
+    -device virtio-blk-device,drive=hd0 \
+    -netdev tap,id=mynet0,ifname=tap1,script=no,downscript=no \
+    -device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:57 \
+    -append "root=LABEL=rootfs console=ttyS0"
+```
+两台虚拟机只有使用的 tap 接口和 MAC 地址不同。
+* `-machine virt`：指定 QEMU 模拟的 RISC-V 平台。
+* `-nographic`：不启动图形界面，所有输出将显示在终端。
+* `-m 4096M`：为虚拟机分配 4GB 内存。
+* `-cpu rv64`：指定 CPU 类型为 RV64
+* `-smp 3`：指定核心数为 3。
+* `-kernel`：引导文件的路径，这里使用 u-boot 编译生成的 RISC-V 下的引导文件 u-boot.elf。
+* `-bios`：这里指定了 qemu 自带的 OpenSBI 固件，用于将 RISC-V 平台在 M-Mode 和 S-Mode 中切换。
+* `-kernel /root/u-boot/u-boot`：编译 u-boot 生成的引导文件，用于引导内核。
+* `-drive file=./EulixOS-3.0.qcow2,if=none,format=qcow2,id=hd0`：指定操作系统镜像。
+* `-device virtio-blk-device,drive=hd0`：挂载磁盘镜像。
+* `-netdev tap,id=mynet0,ifname=tap0,script=no,downscript=no`：将 TAP 接口与虚拟机的网络设备连接。
+* `-device virtio-net-device,netdev=mynet0,mac=52:54:00:12:34:56`：指定虚拟机的网络设备类型和 mac 地址，其中 mac 地址必须手动指定，不然启动虚拟机后两个虚拟机分配的 ip 地址是相同的。
+
+经历一段启动过程后，出现登录界面：
+
+<img src="./assets/启动界面.png">
+
+登录后进入系统，首先给虚拟机分配 ip：
+
+编辑 `/etc/sysconfig/network-scripts/ifcfg-eth0`：
+
+```
+BOOTPROTO=static
+IPADDR=10.0.3.15	# 这里 test 是 10.0.4.15
+NETMASK=255.255.255.0
+GATEWAY=10.0.3.56   # 网关，这里应该是 tap 接口的 ip。test 配置成 10.0.4.56
+```
+随后重启虚拟机网络：
+```shell
+systemctl daemon-reload
+systemctl restart NetworkManager
+```
+
+随后退出给 tap0 和 tap1 分配 ip：
+
+```shell
+ifconfig tap0 10.0.3.56
+ifconfig tap1 10.0.4.56
+```
+
+* **系统**：服务端和测试端均为 EulixOS 3.0
+* IP 地址：
+  * 服务端：10.0.3.15/24
+  * 测试端：10.0.4.15/24
+* 配置：测试端和服务端均为 3 核 4G 内存
 
 **添加 DNS 记录**
 
 在 /etc/hosts 里添加记录方便使用别名：
 
 ```
-192.168.0.215 server
-192.168.0.117 test
+10.0.3.15 server
+10.0.4.15 test
 ```
 
 **安装 eBPF 环境**（服务端和测试端）：
@@ -56,7 +209,7 @@ bpf_program = open("test_hello_world.c", "r").read()
 print(type(bpf_program))
 
 b = BPF(text=bpf_program)
-syscall = b.get_syscall_fnname("execve")
+syscall = b.get_syscall_fnname("read")
 b.attach_kprobe(event=syscall, fn_name="hello_world")
 
 print("eBPF program loaded.")
@@ -85,14 +238,12 @@ test.py：
 ```python
 import paramiko
 import os
-import subprocess
 from time import sleep
 
 # 服务端信息
 SERVICE_IP = "server"  # 服务端 IP 地址
 SERVICE_USER = "root"         # 服务端 SSH 用户
 SERVICE_PASS = "Liu20021231" # 服务端 SSH 密码
-PID = "25001"           # 进程 PID
 DURATION = 10           # 信息采集持续时间，单位为秒
 
 def test():
@@ -100,12 +251,16 @@ def test():
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=SERVICE_IP, port=22, username=SERVICE_USER, password=SERVICE_PASS)
+        
+        # 获取进程 PID
+        stdin, stdout, stderr = client.exec_command("pgrep -f workload.py")
+        pid = stdout.read().decode('utf-8')
 
         # 调用终端
         shell = client.invoke_shell()
 
         # 查看堆栈追踪
-        command = f"cd ~/os-work && perf record -e sched:sched_switch -p {PID} -a sleep {DURATION}"
+        command = f"cd /{SERVICE_USER}/os-work && perf record -e sched:sched_switch -p {pid} -a sleep {DURATION}"
         print(f"Running command on server: {command}")
 		# 运行命令
         shell.send(command + '\n')
@@ -114,7 +269,7 @@ def test():
 
         sftp = client.open_sftp()
 
-        sftp.get("perf.data", "perf.data")
+        sftp.get(f"/{SERVICE_USER}/os-work/perf.data", "perf.data")
         os.system("perf script")
 
         shell.close()
@@ -124,7 +279,6 @@ def test():
 
 if __name__ == "__main__":
     test()
-
 ```
 
 使用 paramiko 库在服务端运行 perf 命令生成 perf.data 后，将 perf.data 数据通过 SFTP 传回测试端，随后在测试端通过 perf script 展示数据。测试得到测试端可采集服务端负载数据。
@@ -171,27 +325,67 @@ END {
 # 1. 执行 Redis 基准测试
 redis-benchmark -h 192.168.0.215 -p 6379 -t set,get -n 1000000 -c 50 -d 64
 
-# 2. 启动 perf 记录 Redis 进程的性能数据
-# 需要先确认 Redis 进程的 PID
-REDIS_PID=$(pgrep redis-server)
-
-# 如果没有 Redis 进程 PID，退出脚本
-if [ -z "$REDIS_PID" ]; then
-    echo "No Redis process found, exiting..."
-    exit 1
-fi
-
-# 使用 perf 工具记录 Redis 进程的性能数据，监控调用栈
-sudo perf record -p $REDIS_PID -F 200 -g -- sleep 10
-
-# 3. 生成 perf 的文本输出
-sudo perf script > perf.out
-
-# 4. 使用 Flamegraph 工具处理 perf 输出，生成火焰图
-/root/FlameGraph/stackcollapse-perf.pl perf.out > perf.folded
-/root/FlameGraph/flamegraph.pl perf.folded > flamegraph.svg
-
+# 2. 启动程序收集函数调用信息，并绘制火焰图
+python3 test_redis.py
 ```
+
+`test_redis.py：`
+```python
+import paramiko
+import os
+from time import sleep
+
+# 服务端信息
+SERVICE_IP = "server"  # 服务端 IP 地址
+SERVICE_USER = "root"         # 服务端 SSH 用户
+SERVICE_PASS = "Liu20021231" # 服务端 SSH 密码
+DURATION = 30           # 信息采集持续时间，单位为秒
+
+def test():
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=SERVICE_IP, port=22, username=SERVICE_USER, password=SERVICE_PASS)
+
+        # 启动 perf 记录 Redis 进程的性能数据
+        # 需要先确认 Redis 进程的 PID
+        stdin, stdout, stderr = client.exec_command("pgrep redis-server")
+
+        # 获得 redis-server 的 pid
+        redis_pid = stdout.read().decode('utf-8')
+        if redis_pid is None or redis_pid == "":
+            # 如果没有 Redis 进程 PID，返回
+            print("No Redis process found, exiting...")
+            return
+
+        shell = client.invoke_shell()
+
+        # 使用 perf 工具记录 Redis 进程的性能数据，监控调用栈
+        command = f"perf record -p {redis_pid.strip()} -F 200 -g sleep {DURATION}"
+        print(f"Running command on server: {command}")
+
+        shell.send(command + '\n')
+
+        sleep(DURATION + 1)
+
+        sftp = client.open_sftp()
+
+        sftp.get("perf.data", "perf.data")
+        sftp.close()
+        shell.close()
+        client.close()
+        os.system("perf script > perf.out")
+
+        os.system("/root/FlameGraph/stackcollapse-perf.pl perf.out > perf.folded")
+        os.system("/root/FlameGraph/flamegraph.pl perf.folded > flamegraph.svg")
+
+    except Exception as e:
+        print(f"Error processing: {e}")
+
+if __name__ == "__main__":
+    test()
+```
+
 输出结果
 ![flamegraph](./assets/flamegraph.svg)
 
@@ -382,10 +576,300 @@ struct l7_event {
 - 由于使用eBPF检测redis事件，会在一定程度上降低redis的操作执行时间，因此通过perf文件夹中的measure.go测量开启eBPF程序对redis操作的影响。measure.go的主要作用是对 Redis 数据库的基本操作（SET、GET、UPDATE、DELETE）进行性能测试，测量每种操作在多次重复执行后的平均延迟时间。
 
 **测试结果如下：**
-<img src="./assets/comparison_data.png" height="75%" width="75%">
+
+<img src="./assets/comparison_data.png" height="50%" width="50%">
 
 **对比图如下：**
+
 <img src="./assets/latency_comparison.png" height="75%" width="75%">
 
 **说明：**
 - bpf2go是一个用于将 eBPF 程序（通常是用 C 语言编写）转换为 Go 语言代码的工具。在给定的代码中，通过//go:generate go run github.com/cilium/ebpf/cmd/bpf2go redis redis.c这行注释，指示go generate工具运行bpf2go来处理redis.c文件，并生成相应的 Go 代码。
+
+## 基于eBPF的性能加速
+
+实验参考论文**Fast, Flexible, and Practical Kernel Extensions**，并应老师要求，这部分基于其开源代码及说明文档进行原论文的复现实验。实验位于test机器上。
+
+### 1.原理及代码结构
+
+#### 1.1 原理
+
+​	KFlex是一种内核扩展方法，其设计基于一个观察：安全性由两个子属性组成——内核接口的合规性和扩展的正确性。
+
+- 内核接口的合规性：使用自动化验证最为适合，因为对内核资源的访问必须满足语义要求，超出了内存安全的范围，例如必须保持内核数据结构的不变性。由于扩展只能通过明确定义的接口（如特定的钩子输入和辅助函数）访问内核资源，因此使用自动化验证技术足以保证这些资源的安全。
+
+- 扩展的正确性：使用运行时检查来确保扩展的正确性，因为内核仅要求扩展在访问扩展自有内存时保持内存安全并避免死锁。为了使得运行时检查尽可能简单，KFlex 将扩展拥有的内存分配到内核虚拟地址空间的一个专用区域，从而消除了内核资源与扩展资源之间的内存别名问题
+
+​	对用户空间优化正基于以上两点保证：通过拓展堆，用户空间应用程序和内核扩展之间能够直接访问共享内存，避免了常规的系统调用开销
+
+- 内存地址的有效映射，即内核接口的合规性问题
+  - 指针翻译为了确保内核扩展与用户空间应用程序之间的内存访问正确性，KFlex 通过其指针翻译机制来解决内存地址映射问题。具体实现如下：KFlex 在扩展中通过 Kie (KFlex Instrumentation Engine) 进行地址翻译。在扩展代码中访问共享堆的指针时，Kie 会将这些指针翻译成用户空间有效的地址。也就是说，当扩展代码存储指向共享堆的指针时，Kie 会自动调整这些指针的基地址，以适应用户空间映射的地址。当扩展代码存储指针时，Kie 会通过动态翻译确保指针存储的地址指向的是用户空间映射的地址，而不是扩展的内核空间地址。这种翻译是 透明的，对扩展的正确性没有影响，因为在扩展代码下一次访问该指针时，Kie 会重新检查地址，确保其有效。KFlex 允许开发者选择是否禁用存储时翻译（translate on store）功能。如果禁用该功能，扩展的运行时开销会更低，因为不需要每次存储时进行翻译。但如果选择禁用，开发者需要自己处理应用程序中存储访问的指针翻译，这通常会增加开发复杂性。
+- 扩展正确性： 临时时间片扩展
+  -  KFlex 允许用户空间应用程序在持有可能被扩展抢占的锁时请求一个额外的时间片在时间片结束时，用户空间应用程序会被强制抢占，从而保证系统的前进遇到 非合作的用户空间进程，即进程持有锁并且不释放，KFlex 会通过扩展取消机制（extension cancellation）来处理中断。当扩展发现等待的锁无法获得时，它会继续自旋，直到超时并被取消。扩展取消时，KFlex 会卸载扩展，但不会销毁扩展堆，因为它可能仍在用户空间应用程序中使用。只有当应用程序明确关闭堆文件描述符或应用程序终止时，堆才会被释放
+
+### 1.2 代码结构
+
+```
+KFlex (Public)
+├── bench	
+├── bpf
+├── include
+├── libbpf
+├── linux @ a6d0177
+├── src
+├── tests
+```
+
+其中linux文件夹是子项目，存放定制放入KFlex的内核。重点解释bpf和libbpf：
+
+- bpf：内核空间程序，负责处理拓展堆空间分配和拓展堆的数据结构等。如：
+
+  ```
+  #define ffkx_heap(size, flags)                 \
+    struct {                                     \
+      __uint(type, BPF_MAP_TYPE_HEAP);           \
+      __uint(key_size, 4);                       \
+      __uint(value_size, 4096);                  \
+      __uint(max_entries, size * 262144);        \
+      __uint(map_flags, BPF_F_MMAPABLE | flags); \
+    }
+  ```
+
+- libbpf：用户空间程序，负责内核交互，如用于触发系统调用，创建相关map的`static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)`
+
+### 2.部署方法
+
+#### 2.1依赖
+
+```
+sudo dnf groupinstall "Development Tools"
+```
+
+```
+sudo dnf install gcc elfutils-libelf-devel zlib-devel cmake clang Bear ninja-build pkgconf dwarves jmealloc-version kernel-devel openssl-devel
+```
+
+另两个依赖包需要从源码安装：
+
+abseil-cpp：
+
+```
+git clone https://github.com/abseil/abseil-cpp.git
+cd abseil
+mkdir build && cd build
+cmake ..
+make
+make install
+```
+
+google benchmark：
+
+```
+git clone https://github.com/google/benchmark.git
+cd benchmark
+cmake -E make_directory "build"
+cmake -E chdir "build" cmake -DBENCHMARK_DOWNLOAD_DEPENDENCIES=on -DCMAKE_BUILD_TYPE=Release ../
+cmake --build "build" --config Release
+cmake --build "build" --config Release --target install
+```
+
+测试benchmark运行状况，检验安装是否成功：
+
+```
+cmake -E chdir "build" ctest --build-config Release
+```
+
+#### 2.2 编译安装LLVM
+
+```
+git clone https://github.com/llvm/llvm-project.git
+mkdir -p llvm-project/llvm/build
+cd llvm-project/llvm/build
+cmake .. -G "Ninja" -DLLVM_TARGETS_TO_BUILD="BPF;X86" \
+        -DLLVM_ENABLE_PROJECTS="clang"    \
+        -DCMAKE_BUILD_TYPE=Release        \
+        -DLLVM_BUILD_RUNTIME=OFF
+ninja
+```
+
+检验是否编译成功：
+
+```
+(...)/llvm-project/llvm/build/bin/clang --version
+```
+
+![](.\assets\llvm.png)
+
+显示如上信息，编译成功
+
+#### 2.3 构建KFlex
+
+```
+git clone https://github.com/rs3lab/KFlex.git
+git submodule update --init
+BPFTOOL=../bpftool CLANG=/path/to/llvm/clone/llvm-project/llvm/build/bin/clang ./build.sh
+```
+
+#### 2.4 构建定制内核
+
+项目会构建定制内核代码到/KFlex/linux下
+
+需要将对应操作系统内核的配置文件.config放置至对应文件夹中，然后执行`make olddefconfig`
+
+```
+make -j$(nproc)
+make modules_install
+make install
+```
+
+在uefi引导方式下，可能会报错如下：
+
+![](.\assets\core_error.png)
+
+经多天查询，得知Makfile中构建内核启动引导的方式是传统BIOS方式下的方式，而uefi方式下\boot文件分区为vfat，不允许符号链接。运行`lsblk -f`查看分区类型：
+
+![1735638800030](.\assets\vfat.png)
+
+符合上述原因。
+
+解决方案：
+
+使用grub2工具即可。在vmlinuz.boot处于boot文件夹下的情况下，执行`grub2-mkconfig` 更新引导文件配置。
+
+问题来源：
+
+我们最初在云服务器上使用 OpenEuler 24.03 LTS 开发，而云服务器使用 UEFI 方式引导，因此产生了该错误。
+
+### 3.执行方法
+
+针对Redis框架，KFlex对于GETS/SETS及ZADD的卸载操作如下，\<NR\>是端口号：
+
+```
+./ffkx --kredis --ifindex <NR>
+```
+
+之后使用`redis-benchmark`等测试工具测试性能即可。
+
+实际执行中，无论是执行作者准备的benchmark，还是上述卸载操作均遇到问题如下：
+
+![1735638800030](.\assets\failed.jpg)
+
+经查询，问题可能来自于内核设置。为排除错误可能性，调整系统配置`max_map_count`，如设置`sysctl -w vm.max_map_count=1000000`，或通过`ulimit -l unlimited`设置进程的 `RLIMIT_MEMLOCK` 限制，均无效，故判断来源于系统内存不足。
+
+为确定错误，进一步溯源错误，确定来源于系统调用执行失败：
+
+```
+static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
+			  unsigned int size)
+{
+	return syscall(__NR_bpf, cmd, attr, size);
+}
+```
+
+其中attr数据结构如下：
+
+```
+union bpf_attr {
+	struct {
+		__u32 map_type;	
+		__u32 key_size;
+		__u32 value_size;
+		__u32 max_entries;
+		//.....
+```
+
+其中与内存申请大小相关的为key_size,value_size,max_entries，分别代表与 BPF map 创建直接相关的字段，它们定义了 map 的类型、每个条目的大小以及 map 的容量限制。
+
+修改上层调用函数`libbpf/src/libbpf.c/bpf_map_create`代码，增加错误信息：
+
+```
+static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, bool is_inner)
+{
+	...
+
+	if (obj->gen_loader) {
+		bpf_gen__map_create(obj->gen_loader, def->type, map_name,
+				    def->key_size, def->value_size, def->max_entries,
+				    &create_attr, is_inner ? -1 : map - obj->maps);
+		/* We keep pretenting we have valid FD to pass various fd >= 0
+		 * checks by just keeping original placeholder FDs in place.
+		 * See bpf_object__add_map() comment.
+		 * This placeholder fd will not be used with any syscall and
+		 * will be reset to -1 eventually.
+		 */
+		map_fd = map->fd;
+	} else {
+		//这里出错
+		map_fd = bpf_map_create(def->type, map_name,
+					def->key_size, def->value_size,
+					def->max_entries, &create_attr);
+		//增加错误信息输出
+		pr_warn("BPF Map key_size: %u, value_size: %u, max_entries: %u\n",
+        key_size, value_size, max_entries);
+	}
+	if (map_fd < 0 && (create_attr.btf_key_type_id || create_attr.btf_value_type_id)) {
+		char *cp, errmsg[STRERR_BUFSIZE];
+
+		err = -errno;
+		cp = libbpf_strerror_r(err, errmsg, sizeof(errmsg));
+		pr_warn("Error in bpf_create_map_xattr(%s):%s(%d). Retrying without BTF.\n",
+			map->name, cp, err);
+		create_attr.btf_fd = 0;
+		create_attr.btf_key_type_id = 0;
+		create_attr.btf_value_type_id = 0;
+		map->btf_key_type_id = 0;
+		map->btf_value_type_id = 0;
+		map_fd = bpf_map_create(def->type, map_name,
+					def->key_size, def->value_size,
+					def->max_entries, &create_attr);
+	}
+
+	if (bpf_map_type__is_map_in_map(def->type) && map->inner_map) {
+		if (obj->gen_loader)
+			map->inner_map->fd = -1;
+		bpf_map__destroy(map->inner_map);
+		zfree(&map->inner_map);
+	}
+
+	if (map_fd < 0)
+	//这里返回错误map_fd
+		return map_fd;
+
+	/* obj->gen_loader case, prevent reuse_fd() from closing map_fd */
+	if (map->fd == map_fd)
+		return 0;
+
+	/* Keep placeholder FD value but now point it to the BPF map object.
+	 * This way everything that relied on this map's FD (e.g., relocated
+	 * ldimm64 instructions) will stay valid and won't need adjustments.
+	 * map->fd stays valid but now point to what map_fd points to.
+	 */
+	return reuse_fd(map->fd, map_fd);
+}
+```
+
+输出如下：
+
+<img src="./assets/info.png">
+
+计算可知共分配约275G内存，大大超过实验设备能力，故内存分配失败。参考原论文配置：
+
+```
+a 96-core (192-thread) Intel Xeon Platinum 8468 CPU running at 2.30GHz, 512GB of RAM, and an Intel X710 10 Gbps NIC
+```
+
+可知的确非实验设备可以直接部署，尝试修改配置以适应实验环境。
+
+相关数据结构定义在`bpf/include/ffkx_heap.bpf.h`
+
+```
+#define ffkx_heap(size, flags)                 \
+  struct {                                     \
+    __uint(type, BPF_MAP_TYPE_HEAP);           \
+    __uint(key_size, 4);                       \
+    __uint(value_size, 4096);                  \
+    __uint(max_entries, size * 262144);        \
+    __uint(map_flags, BPF_F_MMAPABLE | flags); \
+  }
+```
+

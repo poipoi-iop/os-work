@@ -1,14 +1,13 @@
 import paramiko
 import os
-import subprocess
 from time import sleep
 
 # 服务端信息
-SERVICE_IP = "192.168.0.215"  # 服务端 IP 地址
-SERVICE_USER = "root"         # 服务端 SSH 用户
-SERVICE_PASS = "Liu20021231" # 服务端 SSH 密码
-PID = "25001"           # 进程 PID
-DURATION = 10           # 信息采集持续时间，单位为秒
+SERVICE_IP = "server"  # 服务端 IP 地址
+SERVICE_USER = "root"  # 服务端 SSH 用户
+SERVICE_PASS = "Liu20021231"  # 服务端 SSH 密码
+DURATION = 10  # 信息采集持续时间，单位为秒
+
 
 def test():
     try:
@@ -16,19 +15,24 @@ def test():
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=SERVICE_IP, port=22, username=SERVICE_USER, password=SERVICE_PASS)
 
+        # 获取进程 PID
+        stdin, stdout, stderr = client.exec_command("pgrep -f workload.py")
+        pid = stdout.read().decode('utf-8')
+
+        # 调用终端
         shell = client.invoke_shell()
 
         # 查看堆栈追踪
-        command = f"cd ~/os-work && perf record -e sched:sched_switch -p {PID} -a sleep {DURATION}"
+        command = f"cd /{SERVICE_USER}/os-work && perf record -e sched:sched_switch -p {pid} -a sleep {DURATION}"
         print(f"Running command on server: {command}")
-
+        # 运行命令
         shell.send(command + '\n')
-
+        # 等待 perf 采集数据，并留出一秒作为冗余
         sleep(DURATION + 1)
 
         sftp = client.open_sftp()
 
-        sftp.get("perf.data", "perf.data")
+        sftp.get(f"/{SERVICE_USER}/os-work/perf.data", "perf.data")
         os.system("perf script")
 
         shell.close()
