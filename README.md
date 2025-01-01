@@ -1,6 +1,17 @@
 # 实验16：基于 eBPF 内核拓展的应用加速
 
+## 分工
+
+搭建环境：刘继中
+
+基于eBPF性能分析：林志骋
+
+复现相关论文，尝试实现性能加速：徐宇腾
+
+项目链接：[poipoi-iop/os-work: OS 大作业仓库](https://github.com/poipoi-iop/os-work)
+
 ## 环境
+
 ### 使用 QEMU 启动 EulixOS
 由于启动需要使用 uboot.elf，所以需要先在 riscv 下编译 uboot。
 基于 openeuler 24.03 LTS。
@@ -646,7 +657,7 @@ sudo dnf groupinstall "Development Tools"
 ```
 
 ```
-sudo dnf install gcc elfutils-libelf-devel zlib-devel cmake clang Bear ninja-build pkgconf dwarves jmealloc-version kernel-devel openssl-devel
+sudo dnf install gcc elfutils-libelf-devel zlib-devel cmake clang Bear ninja-build pkgconf dwarves jemalloc-devel kernel-devel openssl-devel
 ```
 
 另两个依赖包需要从源码安装：
@@ -714,7 +725,7 @@ BPFTOOL=../bpftool CLANG=/path/to/llvm/clone/llvm-project/llvm/build/bin/clang .
 
 项目会构建定制内核代码到/KFlex/linux下
 
-需要将对应操作系统内核的配置文件.config放置至对应文件夹中，然后执行`make olddefconfig`
+需要将对应操作系统内核的配置文件.config放置至对应文件夹中，然后执行`make olddefconfig`。对应的.config存在/boot目录下。
 
 ```
 make -j$(nproc)
@@ -726,7 +737,7 @@ make install
 
 ![](.\assets\core_error.png)
 
-经多天查询，得知Makfile中构建内核启动引导的方式是传统BIOS方式下的方式，而uefi方式下\boot文件分区为vfat，不允许符号链接。运行`lsblk -f`查看分区类型：
+Makfile中构建内核启动引导的方式是传统BIOS方式下的方式，而uefi方式下\boot文件分区为vfat，不允许符号链接。运行`lsblk -f`查看分区类型：
 
 ![1735638800030](.\assets\vfat.png)
 
@@ -735,10 +746,6 @@ make install
 解决方案：
 
 使用grub2工具即可。在vmlinuz.boot处于boot文件夹下的情况下，执行`grub2-mkconfig` 更新引导文件配置。
-
-问题来源：
-
-我们最初在云服务器上使用 OpenEuler 24.03 LTS 开发，而云服务器使用 UEFI 方式引导，因此产生了该错误。
 
 ### 3.执行方法
 
@@ -754,9 +761,13 @@ make install
 
 ![1735638800030](.\assets\failed.jpg)
 
-经查询，问题可能来自于内核设置。为排除错误可能性，调整系统配置`max_map_count`，如设置`sysctl -w vm.max_map_count=1000000`，或通过`ulimit -l unlimited`设置进程的 `RLIMIT_MEMLOCK` 限制，均无效，故判断来源于系统内存不足。
+经查询，问题可能来自于内核设置。为排除错误可能性，调整系统配置`max_map_count`，如设置`sysctl -w vm.max_map_count=1000000`，或通过`ulimit -l unlimited`设置进程的 `RLIMIT_MEMLOCK` 限制，均无效，初步判断来源于系统内存不足。
 
-为确定错误，进一步溯源错误，确定来源于系统调用执行失败：
+定位错误来源于`libbpf/src/libbpf.c/bpf_object__create_maps`中`bpf_object__create_map`函数执行失败。为确定错误，进一步溯源错误，确定来源于系统调用执行失败。函数执行顺序如下：
+
+![1735638800030](.\assets\flow.jpg)
+
+最终调用系统调用的函数如下：
 
 ```
 static inline int sys_bpf(enum bpf_cmd cmd, union bpf_attr *attr,
@@ -778,7 +789,7 @@ union bpf_attr {
 		//.....
 ```
 
-其中与内存申请大小相关的为key_size,value_size,max_entries，分别代表与 BPF map 创建直接相关的字段，它们定义了 map 的类型、每个条目的大小以及 map 的容量限制。
+这部分代码较简单，只与创建bpf_map相关，因此怀疑是内存限制导致无法执行成功。其中与内存申请大小相关的为key_size,value_size,max_entries，分别代表与 BPF map 创建直接相关的字段，它们定义了 map 的类型、每个条目的大小以及 map 的容量限制。
 
 修改上层调用函数`libbpf/src/libbpf.c/bpf_map_create`代码，增加错误信息：
 
@@ -805,46 +816,16 @@ static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, b
 					def->max_entries, &create_attr);
 		//增加错误信息输出
 		pr_warn("BPF Map key_size: %u, value_size: %u, max_entries: %u\n",
-        key_size, value_size, max_entries);
+        def->key_size, def->value_size,def->max_entries);
 	}
-	if (map_fd < 0 && (create_attr.btf_key_type_id || create_attr.btf_value_type_id)) {
-		char *cp, errmsg[STRERR_BUFSIZE];
-
-		err = -errno;
-		cp = libbpf_strerror_r(err, errmsg, sizeof(errmsg));
-		pr_warn("Error in bpf_create_map_xattr(%s):%s(%d). Retrying without BTF.\n",
-			map->name, cp, err);
-		create_attr.btf_fd = 0;
-		create_attr.btf_key_type_id = 0;
-		create_attr.btf_value_type_id = 0;
-		map->btf_key_type_id = 0;
-		map->btf_value_type_id = 0;
-		map_fd = bpf_map_create(def->type, map_name,
-					def->key_size, def->value_size,
-					def->max_entries, &create_attr);
-	}
-
-	if (bpf_map_type__is_map_in_map(def->type) && map->inner_map) {
-		if (obj->gen_loader)
-			map->inner_map->fd = -1;
-		bpf_map__destroy(map->inner_map);
-		zfree(&map->inner_map);
-	}
+	
+	...
 
 	if (map_fd < 0)
 	//这里返回错误map_fd
 		return map_fd;
-
-	/* obj->gen_loader case, prevent reuse_fd() from closing map_fd */
-	if (map->fd == map_fd)
-		return 0;
-
-	/* Keep placeholder FD value but now point it to the BPF map object.
-	 * This way everything that relied on this map's FD (e.g., relocated
-	 * ldimm64 instructions) will stay valid and won't need adjustments.
-	 * map->fd stays valid but now point to what map_fd points to.
-	 */
-	return reuse_fd(map->fd, map_fd);
+	
+	...
 }
 ```
 
@@ -852,7 +833,7 @@ static int bpf_object__create_map(struct bpf_object *obj, struct bpf_map *map, b
 
 <img src="./assets/info.png">
 
-计算可知共分配约275G内存，大大超过实验设备能力，故内存分配失败。参考原论文配置：
+计算可知共分配约256G内存，大大超过实验设备能力，故内存分配失败。参考原论文配置：
 
 ```
 a 96-core (192-thread) Intel Xeon Platinum 8468 CPU running at 2.30GHz, 512GB of RAM, and an Intel X710 10 Gbps NIC
@@ -873,3 +854,198 @@ a 96-core (192-thread) Intel Xeon Platinum 8468 CPU running at 2.30GHz, 512GB of
   }
 ```
 
+可知value_size设置为4KB，max_entries的设置中，262144恰好为1G内存可放入value的数量。因此，size的值可直接等于分配的内存数（单位GB）。相关heap创建函数来源于`bpf/ffkx_memcached.bpf.c`文件，如下：
+
+```
+ffkx_heap(256, 0) heap SEC(".maps");
+```
+
+将size=256修改为环境允许的4，即4G内存，编译重新执行,依旧报错如下：
+
+<img src="./assets/new_error.png">
+
+成功修改，但注意到map_fd为13，提示错误位置变化。为了确定错误位置，重新对`libbpf/src/libbpf.c `中`bpf_object__create_maps`函数进行错误标记，如下：
+
+```
+bpf_object__create_maps(struct bpf_object *obj)
+{
+	struct bpf_map *map;
+	char *cp, errmsg[STRERR_BUFSIZE];
+	unsigned int i, j;
+	int err;
+	bool retried;
+
+	for (i = 0; i < obj->nr_maps; i++) {
+		map = &obj->maps[i];
+
+		/* To support old kernels, we skip creating global data maps
+		 * (.rodata, .data, .kconfig, etc); later on, during program
+		 * loading, if we detect that at least one of the to-be-loaded
+		 * programs is referencing any global data map, we'll error
+		 * out with program name and relocation index logged.
+		 * This approach allows to accommodate Clang emitting
+		 * unnecessary .rodata.str1.1 sections for string literals,
+		 * but also it allows to have CO-RE applications that use
+		 * global variables in some of BPF programs, but not others.
+		 * If those global variable-using programs are not loaded at
+		 * runtime due to bpf_program__set_autoload(prog, false),
+		 * bpf_object loading will succeed just fine even on old
+		 * kernels.
+		 */
+		if (bpf_map__is_internal(map) && !kernel_supports(obj, FEAT_GLOBAL_DATA))
+			map->autocreate = false;
+
+		if (!map->autocreate) {
+			pr_debug("map '%s': skipped auto-creating...\n", map->name);
+			continue;
+		}
+
+		err = map_set_def_max_entries(map);
+		if (err){
+      pr_warn("map_set_def_max_entries");
+			goto err_out;
+    } 
+
+		retried = false;
+retry:
+		if (map->pin_path) {
+			err = bpf_object__reuse_map(map);
+			if (err) {
+				pr_warn("map '%s': error reusing pinned map\n",
+					map->name);
+				goto err_out;
+			}
+			if (retried && map->fd < 0) {
+				pr_warn("map '%s': cannot find pinned map\n",
+					map->name);
+				err = -ENOENT;
+				goto err_out;
+			}
+		}
+
+		if (map->reused) {
+			pr_debug("map '%s': skipping creation (preset fd=%d)\n",
+				 map->name, map->fd);
+		} else {
+			err = bpf_object__create_map(obj, map, false);
+			if (err){
+        		pr_warn("bpf_object__create_map");
+				goto err_out;
+      		}
+
+			pr_debug("map '%s': created successfully, fd=%d\n",
+				 map->name, map->fd);
+
+			if (bpf_map__is_internal(map)) {
+				err = bpf_object__populate_internal_map(obj, map);
+				if (err < 0){
+          pr_warn("bpf_object__populate_internal_map");
+					goto err_out;
+        }
+			}
+			if (map->def.type == BPF_MAP_TYPE_ARENA) {
+				map->mmaped = mmap((void *)(long)map->map_extra,
+						   bpf_map_mmap_sz(map), PROT_READ | PROT_WRITE,
+						   map->map_extra ? MAP_SHARED | MAP_FIXED : MAP_SHARED,
+						   map->fd, 0);
+				if (map->mmaped == MAP_FAILED) {
+					err = -errno;
+					map->mmaped = NULL;
+					pr_warn("map '%s': failed to mmap arena: %d\n",
+						map->name, err);
+					return err;
+				}
+				if (obj->arena_data) {
+					memcpy(map->mmaped, obj->arena_data, obj->arena_data_sz);
+					zfree(&obj->arena_data);
+				}
+			}
+			if (map->init_slots_sz && map->def.type != BPF_MAP_TYPE_PROG_ARRAY) {
+				err = init_map_in_map_slots(obj, map);
+				if (err < 0){
+          pr_warn("init_map_in_map_slots");
+					goto err_out;
+        }
+			}
+		}
+
+		if (map->pin_path && !map->pinned) {
+			err = bpf_map__pin(map, NULL);
+			if (err) {
+				if (!retried && err == -EEXIST) {
+					retried = true;
+					goto retry;
+				}
+				pr_warn("map '%s': failed to auto-pin at '%s': %d\n",
+					map->name, map->pin_path, err);
+				goto err_out;
+			}
+		}
+
+		if (map->def.type == BPF_MAP_TYPE_HEAP) {
+			__u64 mmap_sz = bpf_map_mmap_sz(map);
+			__u64 it, addr;
+			for (it = 0, addr = roundup(1UL << 48, mmap_sz); addr && it < 1024; it++, addr -= mmap_sz) {
+				map->heap_addr = mmap((void *)addr, mmap_sz, PROT_READ | PROT_WRITE,
+						      MAP_SHARED | MAP_FIXED_NOREPLACE, map->fd, 0);
+				if (map->heap_addr == MAP_FAILED)
+					continue;
+				else
+					break;
+			}
+			if (map->heap_addr == MAP_FAILED) {
+				err = -errno;
+				map->heap_addr = NULL;
+				pr_warn("failed to mmap heap map '%s': %d\n",
+					map->name, err);
+				goto err_out;
+			}
+		}
+	}
+	pr_warn("Excute success!\n");
+	return 0;
+
+err_out:
+	cp = libbpf_strerror_r(err, errmsg, sizeof(errmsg));
+	pr_warn("map '%s': failed to create: %s(%d)\n", map->name, cp, err);
+	pr_perm_msg(err);
+	for (j = 0; j < i; j++)
+		zclose(obj->maps[j].fd);
+	return err;
+}
+```
+
+在所有进入err_out的位置进行print标记，得到的输出：
+
+<img src="./assets/still_error.jpg">
+
+根据输出内容，可知函数`map->heap_addr = mmap((void *)addr, mmap_sz, PROT_READ | PROT_WRITE,MAP_SHARED | MAP_FIXED_NOREPLACE, map->fd, 0)`执行未成功，错误类型仍为12，表示内存不足。针对该问题，查找到了若干可能：
+
+- `vm.max_map_count`决定了一个进程可以创建的最大内存映射区域的数量，该数值过小
+- `vm.overcommit_memory`和`vm.swappiness`代表内核在内存分配请求时的过度提交策略和使用交换空间的积极性
+- 系统对相关资源存在限制，可通过ulimit查看
+
+针对这三个可能，分别尝试了相关措施：
+
+- 设置足够大的vm.max_map_count：echo 1000000 > /proc/sys/vm/max_map_count
+
+- 设置相关参数：
+
+  ```
+  sysctl -w vm.overcommit_memory=1
+  sysctl -w vm.swappiness=10
+  ```
+
+- 对相关资源设置足够大上限或设为unlimited：
+
+  <img src="./assets/limit.png">
+
+但以上措施均无效。截止文档完成时间，并未发现导致该现象的该原因，完全复现失败。
+
+附上论文中作者对Redis的GETS:SETS优化所得结果，即复现目标：
+
+<img src="./assets/goal.jpg">
+
+### 4.展望
+
+本次复现失败，并未实现目标结果。我认为最简单的解决方法还是在内存>=256G的机器上部署（如论文中的机器配置），检查运行情况，方便进一步确定问题所在。
