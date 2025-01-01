@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 # Latency values in microseconds
 operations = ['SET', 'UPDATE', 'DELETE', 'GET']
 latency_with_ebpf = [95.869, 95.926, 46.954, 93.577]
-latency_without_ebpf = [14.006, 13.956, 6.878, 13.736]
+latency_without_ebpf = [50.767, 49.722, 24.538, 48.849]
 
 x = range(len(operations))
 

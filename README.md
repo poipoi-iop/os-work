@@ -445,15 +445,10 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 - 以可读的格式打印Redis协议中的数据内容。
 
 **输出内容如下：**
-```
-2024/12/25 08:45:44 set name os-work, Latency: 3696 ns
-2024/12/25 08:45:44 get name, Latency: 4849 ns
-2024/12/25 08:45:44 del name, Latency: 5866 ns
-2024/12/25 08:45:44 set name linzhicheng, Latency: 2940 ns
-2024/12/25 08:45:44 set name os-work, Latency: 4374 ns
-2024/12/25 08:45:44 get name, Latency: 6298 ns
-2024/12/25 08:45:44 del name, Latency: 3752 ns
-```
+
+<img src="./assets/test1.png" height="75%" width="75%">
+
+<img src="./assets/test2.png" height="75%" width="75%">
 
 #### 3. 模块设计
 ##### 3.1. 用户态程序（Go语言）
