@@ -445,7 +445,9 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 - 以可读的格式打印Redis协议中的数据内容。
 
 **输出内容如下：**
+
 <img src="./assets/test1.png" height="75%" width="75%">
+
 <img src="./assets/test2.png" height="75%" width="75%">
 
 #### 3. 模块设计
